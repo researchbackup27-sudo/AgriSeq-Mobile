@@ -16,10 +16,6 @@ ranks the backbones with an Edge-Efficiency Score (EES) that covers a fixed numb
 | `agriseq_mobile.py` | The methods of the paper as functions: the data split, the task model (frozen backbone with one Dense layer, Table 5), the six schedules and the training settings (Table 6), the Protocol 1 early-stopping rule and the Protocol 2 lowest-validation-loss epoch, export to Keras and TensorFlow Lite (float32 and INT8), staged start-up timing for Keras and TensorFlow Lite, the metrics, the paired bootstrap, the exact McNemar test, the Holm adjustment, the seed-level paired t-test and the Edge-Efficiency Score (Eq 8). |
 | `reproduce.py` | Recomputes the paper's statistics from the deposited per-image predictions and timing observations. It checks every value against the deposited results and prints the headline numbers next to their published values. |
 
-`agriseq_mobile.py` is a reference implementation written from the Materials and methods. It is
-not the notebook that ran the 200 training runs on Kaggle GPUs. A run trained with `train_run`
-uses the same model, settings and stopping rules, but the batch order and GPU kernels differ, so
-its accuracy should fall within the paper's seed-to-seed spread but will not equal the deposited run bit for bit.
 The paper timed each model in a new Python process; the timing functions measure the stages inside
 the process that calls them.
 

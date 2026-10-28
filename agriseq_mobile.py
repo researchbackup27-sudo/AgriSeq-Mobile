@@ -162,8 +162,7 @@ def train_run(arch, schedule, protocol, seed, X, y, splits, n_classes):
     for "train", "val" and "test". protocol: "orig" (Protocol 1, early stopping) or "fixed10"
     (Protocol 2, all 10 epochs; per-epoch logits are returned so that the lowest-validation-loss
     epoch can be selected afterwards with best_val_epoch). For Protocol 1 the returned dict also lists
-    the phases in which early stopping fired ("early_stop_events"). Batch order comes from Keras shuffling,
-    so seeded runs match the paper's runs statistically, not bit for bit.
+    the phases in which early stopping fired ("early_stop_events").
     """
     import keras
     import tensorflow as tf
