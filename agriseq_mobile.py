@@ -6,15 +6,21 @@ Sections follow the Materials and methods of the paper:
 
     data split ............ dataset_listing, split
     task model ............ build_model (frozen ImageNet backbone + one Dense layer, Table 5)
-    training .............. SCHEDULES, make_optimizer, protocol1_early_stopping, train_run (Table 6)
-    statistics ............ metrics_from_cm, resample_weights, boot_metrics, mcnemar_exact, holm,
-                            seed_level_t, best_val_epoch
+    training .............. SCHEDULES, schedule_phases, make_optimizer, protocol1_early_stopping,
+                            train_run (Table 6)
+    learning-rate tuning .. LR_GRID, TUNE_SEEDS, select_learning_rate, tune_learning_rate
+                            (second experiment: tuned rates and training until early stopping)
+    statistics ............ metrics_from_cm (balanced accuracy = macro recall), per_class_recall,
+                            resample_weights, boot_metrics, mcnemar_exact, holm, seed_level_t,
+                            welch_t, signflip_exact, mde_paired_t, best_val_epoch
     export ................ export_models (Keras file, TensorFlow Lite float32 and INT8)
-    timing ................ time_keras_stages, time_tflite_stages (staged start-up timing)
+    timing ................ time_keras_stages, time_tflite_stages (staged start-up timing),
+                            evict_from_file_cache, file_cache_residency (timing with the model file
+                            outside the operating-system file cache)
     Edge-Efficiency Score . ees (Eq 8)
 
-TensorFlow is imported only inside the functions that need it, so the statistics and the score can be
-used (and reproduce.py run) without it.
+TensorFlow is imported only inside the functions that need it, so the statistics, the learning-rate
+selection rule and the score can be used (and reproduce.py and demo.py run) without it.
 """
 import glob
 import os
@@ -31,16 +37,25 @@ LR = {"adam": 1e-3, "sgd": 1e-2}
 SGD_MOMENTUM = 0.9
 E_TOTAL, E_PHASE, PATIENCE = 10, 5, 3
 
+# Second experiment: learning rates tuned on the validation set, then training until early stopping
+# with a 50-epoch limit (25 + 25 for two-phase schedules), with the default and with the selected rates.
+LONG_E_TOTAL, LONG_E_PHASE = 50, 25
+LR_GRID = {"adam": (1e-4, 3e-4, 1e-3, 3e-3, 1e-2), "sgd": (1e-3, 3e-3, 1e-2, 3e-2, 1e-1)}
+TUNE_SEEDS = (7, 2027)                    # not among the evaluation SEEDS
+
 # Schedules 1 to 6. Each phase is (optimizer, epochs). A new optimizer is created at every phase,
 # so the optimizer state is reset at the switch (and at the restart in the two controls).
-SCHEDULES = {
-    "adam": [("adam", E_TOTAL)],
-    "sgd": [("sgd", E_TOTAL)],
-    "adam_sgd": [("adam", E_PHASE), ("sgd", E_PHASE)],
-    "sgd_adam": [("sgd", E_PHASE), ("adam", E_PHASE)],
-    "adam_adam": [("adam", E_PHASE), ("adam", E_PHASE)],
-    "sgd_sgd": [("sgd", E_PHASE), ("sgd", E_PHASE)],
-}
+def schedule_phases(name, e_total=E_TOTAL, e_phase=E_PHASE):
+    """Phases of schedule `name` as (optimizer, epochs): one phase of e_total epochs for Adam and SGD,
+    two phases of e_phase epochs for the switching schedules and the restart controls."""
+    one = {"adam": "adam", "sgd": "sgd"}
+    if name in one:
+        return [(one[name], e_total)]
+    first, second = name.split("_")
+    return [(first, e_phase), (second, e_phase)]
+
+
+SCHEDULES = {n: schedule_phases(n) for n in ("adam", "sgd", "adam_sgd", "sgd_adam", "adam_adam", "sgd_sgd")}
 
 # Keras application name, and whether the input is scaled to [-1, 1] outside the network.
 # EfficientNetB0 rescales internally.
@@ -112,11 +127,13 @@ def build_model(arch, n_classes, with_aug=True):
 
 
 # ---------------------------------------------------------------- training
-def make_optimizer(kind):
+def make_optimizer(kind, lr=None):
+    """Adam or SGD with momentum 0.9. lr: dict of learning rates by optimizer; missing optimizers use LR."""
     import keras
+    rate = {**LR, **(lr or {})}[kind]
     if kind == "adam":
-        return keras.optimizers.Adam(learning_rate=LR["adam"])
-    return keras.optimizers.SGD(learning_rate=LR["sgd"], momentum=SGD_MOMENTUM)
+        return keras.optimizers.Adam(learning_rate=rate)
+    return keras.optimizers.SGD(learning_rate=rate, momentum=SGD_MOMENTUM)
 
 
 def protocol1_early_stopping(patience=PATIENCE):
@@ -155,7 +172,39 @@ def protocol1_early_stopping(patience=PATIENCE):
     return Protocol1EarlyStopping()
 
 
-def train_run(arch, schedule, protocol, seed, X, y, splits, n_classes):
+def seeded_batches(X, y, idx, seed, shuffle=True):
+    """Training batches of BATCH images in an order drawn from one NumPy generator seeded with `seed`.
+
+    The generator is created once per training run and reshuffles after every epoch, so the order
+    continues across the phases of a two-phase schedule (each phase is one fit() call on the same
+    object) and is the same for every schedule trained with the same seed."""
+    import keras
+
+    class SeededBatches(keras.utils.PyDataset):
+        def __init__(self):
+            super().__init__()
+            self.idx = np.asarray(idx)
+            self.rng = np.random.default_rng(seed)
+            self.order = self.idx.copy()
+            if shuffle:
+                self.rng.shuffle(self.order)
+
+        def __len__(self):
+            return int(np.ceil(len(self.idx) / BATCH))
+
+        def __getitem__(self, i):
+            b = self.order[i * BATCH:(i + 1) * BATCH]
+            return X[b], y[b]
+
+        def on_epoch_end(self):
+            if shuffle:
+                self.rng.shuffle(self.order)
+
+    return SeededBatches()
+
+
+def train_run(arch, schedule, protocol, seed, X, y, splits, n_classes, lr=None, e_total=E_TOTAL,
+              e_phase=E_PHASE, keep_epoch_logits=None):
     """Train one configuration and return logits for the validation and test images.
 
     X: float32 images (N, 224, 224, 3) in [0, 255]; y: int labels; splits: dict of index arrays
@@ -163,6 +212,14 @@ def train_run(arch, schedule, protocol, seed, X, y, splits, n_classes):
     (Protocol 2, all 10 epochs; per-epoch logits are returned so that the lowest-validation-loss
     epoch can be selected afterwards with best_val_epoch). For Protocol 1 the returned dict also lists
     the phases in which early stopping fired ("early_stop_events").
+    lr, e_total, e_phase: learning rates and epoch limits. The main analysis uses the defaults (LR, at
+    most 10 epochs); the second experiment uses Protocol 1 with e_total=LONG_E_TOTAL and
+    e_phase=LONG_E_PHASE, with the default rates and with the rates chosen by select_learning_rate.
+    The validation loss after every epoch is returned as "val_loss_history" (used for tuning).
+    keep_epoch_logits: also return the validation and test logits after every epoch ("ep_val_logits",
+    "ep_test_logits"), so that the lowest-validation-loss epoch can be evaluated with best_val_epoch;
+    always on for Protocol 2, optional for Protocol 1 (used in the second experiment).
+    The training batches come from seeded_batches(..., seed): one order per run, continued across phases.
     """
     import keras
     import tensorflow as tf
@@ -181,26 +238,64 @@ def train_run(arch, schedule, protocol, seed, X, y, splits, n_classes):
             for s in ("val", "test"):
                 ep_logits[s].append(logits(splits[s]))
 
-    tr, va = splits["train"], splits["val"]
-    events = []                                              # Protocol 1: where stopping fired
-    for ph, (kind, epochs) in enumerate(SCHEDULES[schedule]):
-        train_model.compile(optimizer=make_optimizer(kind),     # new optimizer: state reset at the switch
+    keep = (protocol == "fixed10") if keep_epoch_logits is None else (keep_epoch_logits or protocol == "fixed10")
+    va = splits["val"]
+    train_batches = seeded_batches(X, y, splits["train"], seed)  # created once: order continues across phases
+    events, val_loss = [], []                                # Protocol 1: where stopping fired
+    for ph, (kind, epochs) in enumerate(schedule_phases(schedule, e_total, e_phase)):
+        train_model.compile(optimizer=make_optimizer(kind, lr),  # new optimizer: state reset at the switch
                             loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
                             metrics=["acc"])
         es = protocol1_early_stopping()
-        cbs = [es] if protocol == "orig" else [KeepEpochLogits()]
-        train_model.fit(X[tr], y[tr], batch_size=BATCH, shuffle=True, epochs=epochs,
-                        validation_data=(X[va], y[va]), callbacks=cbs, verbose=2)
+        cbs = ([KeepEpochLogits()] if keep else []) + ([es] if protocol == "orig" else [])
+        hist = train_model.fit(train_batches, epochs=epochs, validation_data=(X[va], y[va]),
+                               callbacks=cbs, verbose=2)
+        val_loss += [float(v) for v in hist.history["val_loss"]]
         if protocol == "orig":
             events += [dict(e, phase=ph) for e in es.events]
     out = {f"{s}_logits": logits(splits[s]) for s in ("val", "test")}
     out.update({f"{s}_true": y[splits[s]] for s in ("val", "test")})
-    if protocol == "fixed10":
+    out["val_loss_history"] = val_loss
+    if keep:
         out["ep_val_logits"] = np.stack(ep_logits["val"])
         out["ep_test_logits"] = np.stack(ep_logits["test"])
-    else:
+    if protocol == "orig":
         out["early_stop_events"] = events
     return out, infer_model
+
+
+# ---------------------------------------------------------------- learning-rate tuning
+def select_learning_rate(min_val_loss):
+    """Selection rule of the second experiment.
+
+    min_val_loss: dict {learning rate: list of the lowest validation loss of each tuning run (one per
+    tuning seed)}. The rate with the lowest mean is selected; a tie goes to the smaller rate. Test
+    data never enter the choice. Returns (rate, at_grid_edge), where at_grid_edge is True when the
+    selected rate is the smallest or largest rate of the grid (reported as such; the grid is not
+    extended afterwards)."""
+    rates = sorted(min_val_loss)
+    means = {r: round(float(np.mean(min_val_loss[r])), 10) for r in rates}   # round so that exact ties go to the smaller rate
+    best = min(rates, key=lambda r: (means[r], r))
+    return best, best in (rates[0], rates[-1])
+
+
+def tune_learning_rate(arch, optimizer, X, y, splits, n_classes, grid=None, seeds=TUNE_SEEDS,
+                       e_total=LONG_E_TOTAL):
+    """Tune the learning rate of one optimizer ("adam" or "sgd") for one backbone and dataset.
+
+    Every rate of the grid (LR_GRID by default) is trained with the single-optimizer schedule,
+    Protocol 1 and an e_total-epoch limit, once per tuning seed; each run contributes its lowest
+    validation loss. Returns (selected rate, at_grid_edge, {rate: [lowest validation loss per seed]})."""
+    grid = grid or LR_GRID[optimizer]
+    table = {}
+    for rate in grid:
+        table[rate] = []
+        for seed in seeds:
+            out, _ = train_run(arch, optimizer, "orig", seed, X, y, splits, n_classes,
+                               lr={optimizer: rate}, e_total=e_total, e_phase=e_total)
+            table[rate].append(min(out["val_loss_history"]))
+    rate, edge = select_learning_rate(table)
+    return rate, edge, table
 
 
 def export_models(infer_model, out_dir):
@@ -292,9 +387,63 @@ def holm(ps):
 
 
 def seed_level_t(diffs):
-    """Paired t-test across seeds: the training run is the unit (df = number of seeds - 1)."""
+    """Paired t-test across seeds: the training run is the unit (df = number of seeds - 1).
+
+    Runs are paired by seed: they share the training batch order and the starting random state, and
+    within a backbone also the initial weights of the classification layer. When every per-seed
+    difference is the same, the t statistic is undefined; use signflip_exact for such comparisons."""
     from scipy import stats
-    return float(stats.ttest_1samp(np.asarray(diffs, float), 0.0).pvalue)
+    d = np.asarray(diffs, float)
+    if np.allclose(d, d[0]):                # zero variance: 1.0 if all differences are 0, else undefined
+        return 1.0 if np.allclose(d, 0) else float("nan")
+    return float(stats.ttest_1samp(d, 0.0).pvalue)
+
+
+def welch_t(acc_a, acc_b):
+    """Welch's unpaired t-test on the per-seed accuracies of two configurations (ignores the pairing)."""
+    from scipy import stats
+    a, b = np.asarray(acc_a, float), np.asarray(acc_b, float)
+    if a.std() + b.std() == 0:              # both arms constant: 1.0 if equal, else undefined
+        return 1.0 if np.isclose(a.mean(), b.mean()) else float("nan")
+    return float(stats.ttest_ind(a, b, equal_var=False).pvalue)
+
+
+def signflip_exact(diffs):
+    """Exact two-sided sign-flip permutation test of the mean per-seed difference.
+
+    All 2^n sign patterns are enumerated. With n = 5 seeds the smallest attainable p is 2/32 = 0.0625,
+    so this test cannot reach p < 0.05 with five seeds."""
+    import itertools
+    d = np.asarray(diffs, float)
+    if np.allclose(d, 0):
+        return 1.0
+    null = [abs((d * np.array(s)).mean()) for s in itertools.product((1.0, -1.0), repeat=len(d))]
+    return float(np.mean(np.array(null) >= abs(d.mean()) - 1e-12))
+
+
+def mde_paired_t(sd_diff, n=len(SEEDS), alpha=0.05, power=0.8):
+    """Smallest mean difference that a two-sided paired t-test with n pairs detects with the given power,
+    from the standard deviation of the per-seed differences (noncentral t distribution, df = n - 1).
+    With n = 5, alpha = 0.05 and power = 0.8 the required noncentrality is about 3.76."""
+    from scipy import stats
+    from scipy.optimize import brentq
+    df = n - 1
+    tc = stats.t.ppf(1 - alpha / 2, df)
+
+    def pw(nc):
+        return stats.nct.sf(tc, df, nc) + stats.nct.cdf(-tc, df, nc)
+
+    if not sd_diff > 0:
+        return float("nan")
+    nc = brentq(lambda x: pw(x) - power, 0.5, 8.0)
+    return float(nc * sd_diff / np.sqrt(n))
+
+
+def per_class_recall(cm):
+    """Recall of each class from a confusion matrix (rows true, columns predicted). Their mean is the
+    balanced accuracy ("macro_recall" in metrics_from_cm)."""
+    cm = np.asarray(cm, float)
+    return np.diag(cm) / cm.sum(1)
 
 
 # ---------------------------------------------------------------- timing
@@ -362,6 +511,45 @@ def time_tflite_stages(model_path, x, threads=4, warm_calls=15):
     t["warm_call_median_s"] = float(np.median(warm))
     t["startup_s"] = t["load_s"] + t["allocate_s"] + t["first_call_s"]
     return t
+
+
+def evict_from_file_cache(path):
+    """Remove a file's pages from the operating-system file cache (Linux), so that the next process that
+    loads the file reads it from storage. The file is synced first, then posix_fadvise with
+    POSIX_FADV_DONTNEED is applied. Check the result with file_cache_residency. The runtime libraries
+    themselves stay cached."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+    finally:
+        os.close(fd)
+
+
+def file_cache_residency(path):
+    """Share (0 to 1) of a file's pages that are held in the operating-system file cache, measured with
+    mincore() on a read-only memory mapping (creating the mapping reads nothing from the file)."""
+    import ctypes
+    import ctypes.util
+    import mmap
+    size = os.path.getsize(path)
+    if size == 0:
+        return 1.0
+    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    libc.mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
+    page = mmap.PAGESIZE
+    n_pages = (size + page - 1) // page
+    with open(path, "rb") as f:
+        mm = mmap.mmap(f.fileno(), size, prot=mmap.PROT_READ)
+        view = np.frombuffer(mm, dtype=np.uint8)
+        try:
+            vec = (ctypes.c_ubyte * n_pages)()
+            if libc.mincore(ctypes.c_void_p(view.__array_interface__["data"][0]), ctypes.c_size_t(size), vec) != 0:
+                raise OSError(ctypes.get_errno(), "mincore failed")
+        finally:
+            del view
+            mm.close()
+    return float(np.mean(np.frombuffer(vec, dtype=np.uint8) & 1))
 
 
 # ---------------------------------------------------------------- Edge-Efficiency Score (Eq 8)

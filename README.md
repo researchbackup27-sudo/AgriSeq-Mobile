@@ -8,13 +8,16 @@ The study trains one Dense classification layer on a frozen ImageNet backbone (N
 MobileNetV2 or EfficientNet-B0). It compares six optimizer schedules under two training protocols
 over five seeds, exports the models to TensorFlow Lite and times each start-up stage on a CPU. It
 ranks the backbones with an Edge-Efficiency Score (EES) that covers a fixed number of diagnoses.
+A second experiment tunes the learning rates on the validation set and trains until early stopping
+with a 50-epoch limit, and times start-up with the model file outside the operating-system file cache.
 
 ## What is here
 
 | File | Contents |
 |---|---|
-| `agriseq_mobile.py` | The methods of the paper as functions: the data split, the task model (frozen backbone with one Dense layer, Table 5), the six schedules and the training settings (Table 6), the Protocol 1 early-stopping rule and the Protocol 2 lowest-validation-loss epoch, export to Keras and TensorFlow Lite (float32 and INT8), staged start-up timing for Keras and TensorFlow Lite, the metrics, the paired bootstrap, the exact McNemar test, the Holm adjustment, the seed-level paired t-test and the Edge-Efficiency Score (Eq 8). |
-| `reproduce.py` | Recomputes the paper's statistics from the deposited per-image predictions and timing observations. It checks every value against the deposited results and prints the headline numbers next to their published values. |
+| `agriseq_mobile.py` | The methods of the paper as functions: the data split, the task model (frozen backbone with one Dense layer, Table 5), the six schedules and the training settings (Table 6), the Protocol 1 early-stopping rule and the Protocol 2 lowest-validation-loss epoch, export to Keras and TensorFlow Lite (float32 and INT8), staged start-up timing for Keras and TensorFlow Lite, the metrics, the paired bootstrap, the exact McNemar test, the Holm adjustment, the seed-level paired t-test and the Edge-Efficiency Score (Eq 8). For the second experiment: the learning-rate grids, the tuning seeds and the selection rule (`select_learning_rate`, `tune_learning_rate`), the 50-epoch limit (`train_run(..., e_total=50, e_phase=25)`), per-class recall and balanced accuracy, Welch's unpaired t-test, the exact sign-flip test, the smallest difference detectable by the seed-level test, and eviction of a model file from the file cache with a check of its cached pages (`evict_from_file_cache`, `file_cache_residency`, Linux). |
+| `demo.py` | Runs the evaluation methods on synthetic data: per-class recall and balanced accuracy, the learning-rate selection rule, a paired comparison with all tests, the detectable difference, and the file-cache check, followed by implementation checks against independent references. Needs no data and no TensorFlow and finishes in a few seconds. |
+| `reproduce.py` | Recomputes the statistics of the main analysis (the 200 training runs and the CPU timing) from the deposited per-image predictions and timing observations. It checks every value against the deposited results and prints the headline numbers next to their published values. |
 
 The paper timed each model in a new Python process; the timing functions measure the stages inside
 the process that calls them.
@@ -38,6 +41,7 @@ The license below covers this code only.
 
 ```bash
 pip install -r requirements.txt
+python demo.py
 kaggle datasets download -d miitdaga/agriseq-mobile-results --unzip -p agriseq-mobile-results
 python reproduce.py --results-root agriseq-mobile-results --out reproduced.json
 ```
@@ -65,6 +69,14 @@ preds, model = am.train_run("mobilenetv2", "adam_sgd", "orig", seed=1, X=X, y=y,
 files = am.export_models(model, "export/mobilenetv2")   # Keras, TFLite float32, TFLite INT8
 x = X[splits["test"][:1]]
 print(am.time_tflite_stages(files["fp32"], x, threads=4))
+
+# Second experiment: tune the Adam learning rate on the validation set, then train until early stopping
+rate, at_edge, table = am.tune_learning_rate("mobilenetv2", "adam", X, y, splits, len(classes))
+preds, model = am.train_run("mobilenetv2", "adam", "orig", seed=1, X=X, y=y, splits=splits,
+                            n_classes=len(classes), lr={"adam": rate}, e_total=am.LONG_E_TOTAL,
+                            e_phase=am.LONG_E_PHASE)
+am.evict_from_file_cache(files["fp32"])                 # Linux; then time in a new process
+print(am.file_cache_residency(files["fp32"]))           # 0.0 when the file is no longer cached
 ```
 
 ## What `reproduce.py` checks
